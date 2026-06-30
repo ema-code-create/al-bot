@@ -2,8 +2,15 @@ name: AL Daily Tweet
 
 on:
   schedule:
-    # 毎日 JST 8:00 (UTC 23:00 前日) に投稿
-    - cron: "0 23 * * *"
+    # JST 5:00 / 7:00 / 10:00 / 12:00 / 15:00 / 18:00 / 21:00 / 23:00 (UTC-9)
+    - cron: "0 20 * * *"  # JST 05:00
+    - cron: "0 22 * * *"  # JST 07:00
+    - cron: "0  1 * * *"  # JST 10:00
+    - cron: "0  3 * * *"  # JST 12:00
+    - cron: "0  6 * * *"  # JST 15:00
+    - cron: "0  9 * * *"  # JST 18:00
+    - cron: "0 12 * * *"  # JST 21:00
+    - cron: "0 14 * * *"  # JST 23:00
   workflow_dispatch: # 手動実行も可能
 
 jobs:
