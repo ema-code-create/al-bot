@@ -21,8 +21,11 @@ TWEETS = [
 
 def main():
     tweet_text = random.choice(TWEETS)
-    response = client.create_tweet(text=tweet_text)
-    print(f"投稿完了: {tweet_text[:30]}... (id: {response.data['id']})")
+    # ▼▼▼ 動作確認用に投稿を無効化中（確認後は下のコメントアウトを戻すこと） ▼▼▼
+    print(f"[DRY RUN] 投稿内容: {tweet_text}")
+    # response = client.create_tweet(text=tweet_text)
+    # print(f"投稿完了: {tweet_text[:30]}... (id: {response.data['id']})")
+    # ▲▲▲ 動作確認用ここまで ▲▲▲
 
 if __name__ == "__main__":
     main()
