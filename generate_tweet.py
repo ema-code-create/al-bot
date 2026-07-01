@@ -8,9 +8,11 @@ import datetime
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 import requests
 import tweepy
@@ -181,7 +183,7 @@ def fetch_notion_neta() -> list[str]:
 
 
 def generate_tweet(neta_texts: list[str], recent_tweets: list[str]) -> str:
-    """Gemini 2.5 Flash でツイートを生成する"""
+    """Gemini でツイートを生成する。503時はリトライ＋フォールバックモデルで対応する。"""
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     if neta_texts:
@@ -204,15 +206,30 @@ def generate_tweet(neta_texts: list[str], recent_tweets: list[str]) -> str:
 
 上記ネタ帳の中からひとつ選び、アルらしいツイート本文を生成してください。"""
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.9,
-            max_output_tokens=300,
-        ),
-    )
-    return response.text.strip()
+    config = types.GenerateContentConfig(temperature=0.9, max_output_tokens=300)
+    # 高負荷時の503に備えてフォールバックモデルを用意
+    models = ["gemini-2.5-flash", "gemini-2.0-flash-001"]
+    last_error: Exception | None = None
+
+    for model in models:
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=prompt, config=config
+                )
+                print(f"  使用モデル: {model}", file=sys.stderr)
+                return response.text.strip()
+            except genai_errors.ServerError as e:
+                last_error = e
+                wait = 2 ** attempt
+                print(f"  {model} 503エラー (試行{attempt + 1}/3)、{wait}秒後リトライ", file=sys.stderr)
+                time.sleep(wait)
+            except Exception as e:
+                last_error = e
+                print(f"  {model} エラー: {e}", file=sys.stderr)
+                break  # 503以外はリトライせず次のモデルへ
+
+    raise RuntimeError(f"全モデルで生成失敗: {last_error}")
 
 
 def post_tweet(text: str) -> str:
