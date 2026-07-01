@@ -206,7 +206,11 @@ def generate_tweet(neta_texts: list[str], recent_tweets: list[str]) -> str:
 
 上記ネタ帳の中からひとつ選び、アルらしいツイート本文を生成してください。"""
 
-    config = types.GenerateContentConfig(temperature=0.9, max_output_tokens=300)
+    config = types.GenerateContentConfig(
+        temperature=0.9,
+        max_output_tokens=500,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
     # 高負荷時の503に備えてフォールバックモデルを用意
     models = ["gemini-2.5-flash", "gemini-2.0-flash-001"]
     last_error: Exception | None = None
