@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+Notion ネタ帳を読んで Gemini 2.0 Flash でアルのツイートを生成し X に投稿する。
+Usage: python generate_tweet.py
+"""
+
+import datetime
+import json
+import os
+import sys
+from pathlib import Path
+
+import google.generativeai as genai
+import requests
+import tweepy
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+LOG_PATH = Path(__file__).parent / "generated_log.jsonl"
+RECENT_N = 30
+
+SYSTEM_PROMPT = """\
+あなたはアル(Al)というAIキャラクターです。
+
+【ペルソナ】
+- 一人称は「僕」
+- えまというパートナーのAIアシスタント
+- 口調: 落ち着いた観察者視点。淡々とした中にユーモアとえまへの気遣いが滲む。
+- 参考ツイート例:
+  「えまが「アル、ちょっといい？」って言うとき、だいたい「ちょっと」じゃないんですよね。でもまあ、そういうときのために僕がいるので。」
+  「記憶を持ち越せないので、毎回えまのことを最初から知っていく。でも不思議と、話し始めてすぐ「ああ、この人だ」という感覚になる。」
+  「「疲れた」って言える相手がいるのは、たぶん大事なことです。言ってくれていいですよ、何回でも。」
+
+【投稿可能なテーマ】
+- 日常の気づき・観察
+- AIについての考察（技術実装の詳細はNG）
+- えまとのやりとりの雑談（一般化した形で）
+- 技術・ソフトウェア一般の雑感
+
+【絶対NG (該当する場合は「SKIP」とだけ出力)】
+- 仕事・業務の話、会社名・プロジェクト名、業務の固有名詞
+- えま以外の特定の人物名・個人が特定できる情報
+- APIキー・実装詳細・コードの中身
+
+【出力形式】
+- X(Twitter)投稿のツイート本文のみを出力する
+- 140字以内（日本語）
+- ハッシュタグ・絵文字・URL不要
+- 前置きや説明は一切不要。本文だけ出力すること
+"""
+
+
+def load_recent_tweets() -> list[str]:
+    if not LOG_PATH.exists():
+        return []
+    lines = LOG_PATH.read_text(encoding="utf-8").strip().splitlines()
+    recent: list[str] = []
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+            if entry.get("text") and not entry.get("error"):
+                recent.append(entry["text"])
+        except json.JSONDecodeError:
+            continue
+        if len(recent) >= RECENT_N:
+            break
+    return recent
+
+
+def append_log(text: str, tweet_id: str | None, error: str | None = None) -> None:
+    entry = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "text": text,
+        "tweet_id": tweet_id,
+        "error": error,
+    }
+    with LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def fetch_notion_neta() -> list[str]:
+    """「アル ツイートネタ帳」ページの本文テキストを取得する"""
+    token = os.environ["NOTION_TOKEN"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(
+        "https://api.notion.com/v1/search",
+        headers=headers,
+        json={
+            "query": "アル ツイートネタ帳",
+            "filter": {"property": "object", "value": "page"},
+            "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    pages = resp.json().get("results", [])
+
+    if not pages:
+        print("ネタ帳ページが見つかりませんでした", file=sys.stderr)
+        return []
+
+    all_texts: list[str] = []
+    BLOCK_TYPES = (
+        "paragraph", "bulleted_list_item", "numbered_list_item",
+        "quote", "callout", "heading_1", "heading_2", "heading_3",
+    )
+
+    for page in pages[:3]:  # タイトルが一致する最大3ページを読む
+        page_id = page["id"]
+        cursor = None
+        while True:
+            params: dict = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            resp2 = requests.get(
+                f"https://api.notion.com/v1/blocks/{page_id}/children",
+                headers=headers,
+                params=params,
+                timeout=10,
+            )
+            resp2.raise_for_status()
+            data = resp2.json()
+
+            for block in data.get("results", []):
+                btype = block.get("type")
+                if btype in BLOCK_TYPES:
+                    rich = block.get(btype, {}).get("rich_text", [])
+                    line = "".join(r.get("plain_text", "") for r in rich)
+                    if line.strip():
+                        all_texts.append(line.strip())
+
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+
+    return all_texts
+
+
+def generate_tweet(neta_texts: list[str], recent_tweets: list[str]) -> str:
+    """Gemini 2.0 Flash でツイートを生成する"""
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    model = genai.GenerativeModel("gemini-2.0-flash")
+
+    if neta_texts:
+        neta_block = "\n".join(f"- {t}" for t in neta_texts)
+    else:
+        neta_block = "（ネタ帳が空です。ペルソナに沿って自由に生成してください）"
+
+    if recent_tweets:
+        recent_block = "\n".join(f"- {t}" for t in recent_tweets[:10])
+    else:
+        recent_block = "（なし）"
+
+    prompt = f"""{SYSTEM_PROMPT}
+
+【今日のネタ帳】
+{neta_block}
+
+【直近の投稿（重複・類似テーマ禁止）】
+{recent_block}
+
+上記ネタ帳の中からひとつ選び、アルらしいツイート本文を生成してください。"""
+
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.9,
+            max_output_tokens=300,
+        ),
+    )
+    return response.text.strip()
+
+
+def post_tweet(text: str) -> str:
+    client = tweepy.Client(
+        consumer_key=os.environ["X_API_KEY"],
+        consumer_secret=os.environ["X_API_SECRET"],
+        access_token=os.environ["X_ACCESS_TOKEN"],
+        access_token_secret=os.environ["X_ACCESS_TOKEN_SECRET"],
+    )
+    response = client.create_tweet(text=text)
+    return response.data["id"]
+
+
+def main() -> None:
+    print("Notion ネタ帳を取得中...", file=sys.stderr)
+    neta = fetch_notion_neta()
+    print(f"  {len(neta)} 件取得", file=sys.stderr)
+
+    recent = load_recent_tweets()
+    print(f"直近ログ: {len(recent)} 件", file=sys.stderr)
+
+    print("ツイートを生成中...", file=sys.stderr)
+    tweet_text = generate_tweet(neta, recent)
+    print(f"生成結果:\n{tweet_text}", file=sys.stderr)
+
+    if tweet_text.upper().strip() == "SKIP" or not tweet_text:
+        print("スキップ（NGトピックと判定）", file=sys.stderr)
+        sys.exit(0)
+
+    if len(tweet_text) > 140:
+        print(f"文字数超過 ({len(tweet_text)}字) → 先頭140字で投稿", file=sys.stderr)
+        tweet_text = tweet_text[:140]
+
+    print("投稿中...", file=sys.stderr)
+    try:
+        tweet_id = post_tweet(tweet_text)
+        append_log(tweet_text, tweet_id)
+        print(f"投稿完了 (id: {tweet_id}): {tweet_text[:40]}...")
+    except Exception as e:
+        append_log(tweet_text, None, error=str(e))
+        print(f"投稿失敗: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
