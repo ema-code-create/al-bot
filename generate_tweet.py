@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Notion ネタ帳を読んで Gemini 2.0 Flash でアルのツイートを生成し X に投稿する。
+Notion ネタ帳を読んで Gemini 2.5 Flash でアルのツイートを生成し X に投稿する。
 Usage: python generate_tweet.py
 """
 
@@ -10,7 +10,8 @@ import os
 import sys
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import requests
 import tweepy
 
@@ -82,8 +83,20 @@ def append_log(text: str, tweet_id: str | None, error: str | None = None) -> Non
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _page_title(page: dict) -> str:
+    """Notion ページオブジェクトからタイトル文字列を取得する"""
+    props = page.get("properties", {})
+    for prop in props.values():
+        if prop.get("type") == "title":
+            return "".join(r.get("plain_text", "") for r in prop.get("title", []))
+    return ""
+
+
 def fetch_notion_neta() -> list[str]:
-    """「アル ツイートネタ帳」ページの本文テキストを取得する"""
+    """「アル ツイートネタ帳」ページの本文テキストを取得する。
+    複数クエリでフォールバックし、それでも見つからない場合はアクセス可能な
+    全ページをクライアント側でフィルタする。
+    """
     token = os.environ["NOTION_TOKEN"]
     headers = {
         "Authorization": f"Bearer {token}",
@@ -91,30 +104,52 @@ def fetch_notion_neta() -> list[str]:
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(
-        "https://api.notion.com/v1/search",
-        headers=headers,
-        json={
-            "query": "アル ツイートネタ帳",
-            "filter": {"property": "object", "value": "page"},
-            "sort": {"direction": "descending", "timestamp": "last_edited_time"},
-        },
-        timeout=10,
-    )
-    resp.raise_for_status()
-    pages = resp.json().get("results", [])
+    def _search(query: str) -> list[dict]:
+        resp = requests.post(
+            "https://api.notion.com/v1/search",
+            headers=headers,
+            json={
+                "query": query,
+                "filter": {"property": "object", "value": "page"},
+                "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+                "page_size": 20,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("results", [])
+
+    # 段階的にクエリを試みる（絞り込み → 広げる）
+    pages: list[dict] = []
+    for query in ("アル ツイートネタ帳", "ツイートネタ帳", "ネタ帳"):
+        results = _search(query)
+        print(f"  検索「{query}」: {len(results)} 件", file=sys.stderr)
+        if results:
+            pages = results
+            break
+
+    # それでもゼロなら空クエリ（全アクセス可能ページ）をクライアント側フィルタ
+    if not pages:
+        print("  空クエリで全ページを取得してフィルタ...", file=sys.stderr)
+        all_pages = _search("")
+        print(f"  アクセス可能ページ一覧:", file=sys.stderr)
+        for p in all_pages:
+            print(f"    - {_page_title(p)}", file=sys.stderr)
+        pages = [p for p in all_pages if "ネタ帳" in _page_title(p)]
 
     if not pages:
-        print("ネタ帳ページが見つかりませんでした", file=sys.stderr)
+        print("ネタ帳ページが見つかりませんでした（全クエリ試行済み）", file=sys.stderr)
         return []
 
-    all_texts: list[str] = []
+    print(f"  使用ページ: 「{_page_title(pages[0])}」", file=sys.stderr)
+
     BLOCK_TYPES = (
         "paragraph", "bulleted_list_item", "numbered_list_item",
         "quote", "callout", "heading_1", "heading_2", "heading_3",
     )
+    all_texts: list[str] = []
 
-    for page in pages[:3]:  # タイトルが一致する最大3ページを読む
+    for page in pages[:3]:
         page_id = page["id"]
         cursor = None
         while True:
@@ -146,9 +181,8 @@ def fetch_notion_neta() -> list[str]:
 
 
 def generate_tweet(neta_texts: list[str], recent_tweets: list[str]) -> str:
-    """Gemini 2.0 Flash でツイートを生成する"""
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    """Gemini 2.5 Flash でツイートを生成する"""
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     if neta_texts:
         neta_block = "\n".join(f"- {t}" for t in neta_texts)
@@ -170,9 +204,10 @@ def generate_tweet(neta_texts: list[str], recent_tweets: list[str]) -> str:
 
 上記ネタ帳の中からひとつ選び、アルらしいツイート本文を生成してください。"""
 
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
             temperature=0.9,
             max_output_tokens=300,
         ),
